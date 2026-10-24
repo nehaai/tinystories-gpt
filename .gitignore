@@ -1,0 +1,5 @@
+.venv/
+data/
+*.bin
+*.merges
+__pycache__/
