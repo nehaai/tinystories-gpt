@@ -1,65 +1,59 @@
-# bpe-from-scratch
+# tinystories-gpt
 
-A byte-level BPE tokenizer in plain Python, the same algorithm GPT-2/GPT-4 tokenizers use, trained on *Pride and Prejudice* and compared against OpenAI's `tiktoken`.
+Training a small language model from scratch on [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories), one step at a time: data pipeline → bigram baseline → attention → a small GPT.
 
-Part of my 30-day "model user → model trainer" sprint.
+Part of my 30-day "model user → model trainer" sprint. Tokenizer from [bpe-from-scratch](https://github.com/nehaai/bpe-from-scratch).
 
-## What's here
+## Scoreboard
 
-| File | What it does |
-|---|---|
-| `bpe.py` | `Tokenizer` with `train(text, vocab_size)`, `encode(str)`, `decode(ids)` (~120 lines, no dependencies beyond `regex`) |
-| `check.py` | Trains to vocab 1,000, asserts `decode(encode(x)) == x` on edge cases, compares splits with GPT-2 / cl100k / o200k |
-| `explore.py` | Two probes that explain why `12345` tokenizes the way it does |
+Val loss = average cross-entropy on stories the model never trained on. Lower is better. Every new model has to beat the one above it.
 
-## How BPE works, in one paragraph
+| Model | Params | Val loss | Notes |
+|---|---:|---:|---|
+| Uniform guess | 0 | 8.318 | ln(4096), the loss before any training |
+| Bigram | 16.8M | **3.57** | one 4096×4096 lookup table, sees only the previous token |
 
-Models only read numbers, so text has to be chopped into pieces ("tokens") that each get an id. Start with the 256 possible bytes, so any text in any language is representable. Then repeatedly find the most frequent adjacent pair and glue it into a new token. After 744 merges you have a 1,000-token vocabulary where common chunks (` the`, ` Elizabeth`) are single tokens and rare words fall back to smaller pieces. Encoding replays the merges **in the order they were learned**.
+## Data
+
+- My own byte-level BPE, trained to 4,095 tokens on 20 MB of TinyStories. Id 4095 is reserved for end-of-story.
+- **3.95 bytes/token** on TinyStories, against 2.77 when the same tokenizer was trained on *Pride and Prejudice*. Children's stories reuse a small vocabulary, so nearly every word becomes a single token: `Once| upon| a| time|,| there| was| a| little| girl| named| Lily|.`
+- Train: first 200 MB of the train split → 49.7M tokens. Val: the full valid split → 5.6M tokens. Both saved as flat `uint16` arrays.
+
+## Bigram baseline
+
+The simplest model that can learn anything: look at the current token and predict the next one. It's one embedding table, where row *i* holds the scores for "what comes after token *i*".
+
+```
+step     0 | train 8.3178 | val 8.3178
+step  1000 | train 3.7635 | val 3.7749
+step  3000 | train 3.5693 | val 3.5908
+step  5000 | train 3.5337 | val 3.5713
+```
+
+- **Step 0 = ln(4096).** The table is zero-initialised, so the first guess is uniform. Default `N(0,1)` init would start around 8.8.
+- **Train ≈ val.** A lookup table is too simple to memorise 50M tokens.
+- **Plateau at ~3.57.** e^3.57 ≈ 35, so at every token it's as unsure as picking from about 35 options. That's the ceiling for a model that sees one token of context.
+
+What it writes:
+
+> Once upon a little girl named Lily. She says. She water. Emma Do you had to disturled and he was looking for a time, "Yes, Lily watched it and played.
+
+Every adjacent pair is plausible, but the whole is nonsense. After "a" it picks "little" (the most common follow-up), because it doesn't remember "Once upon". It invents "disturled" by chaining token pieces, and it swaps between Lily, Emma, Ben and Tom because it can't remember who the story is about. Fixing that needs context, which is what attention adds next.
 
 ## Run it
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-curl -o novel.txt https://www.gutenberg.org/cache/epub/1342/pg1342.txt
-python check.py novel.txt          # GPT-2 regex pre-split (~7s)
-python check.py novel.txt --raw    # no pre-split (~45s), see the ugly tokens
-python explore.py
+mkdir -p data
+curl -L -o data/valid.txt https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-valid.txt
+curl -L -o data/train.txt https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt
+python prepare.py   # trains tokenizer (~35s), writes data/train.bin + data/val.bin (~15s)
+python bigram.py    # ~5 min on an M-series Mac
 ```
 
-## Results
-
-All round-trips pass. Token counts for the same strings:
-
-| Input | Mine (Austen, 1k vocab) | GPT-2 | cl100k | o200k |
-|---|---:|---:|---:|---:|
-| `12345 + 678` | 11 | 5 | 5 | 5 |
-| A 3-line Python function | 37 | 26 | 18 | 18 |
-| `मुझे हिंदी में बात करना पसंद है।` | **84** | 50 | 32 | **9** |
-
-### 1. A tokenizer only knows what it was trained on
-
-- **Numbers:** my tokenizer learned exactly one digit token (` 1`) from the whole novel, so `12345` stays as `1|2|3|4|5`.
-- **Code:** no `def`, no `"""`, and Austen wrote no Python.
-- **Hindi:** zero merges for Devanagari, so it falls back to raw bytes (3 bytes per character). o200k does the same sentence in 9 tokens. That's a **~9× token tax**: more cost and less context for the same sentence on a tokenizer that didn't see the language.
-
-### 2. Why `12345` splits the way it does
-
-1. **The regex cuts first.** The GPT-2 pattern hands BPE `['12345', ' +', ' 678']`, and merges can never cross those boundaries.
-2. **The training data decides the merges.** Mine has no digit merges, so single digits. GPT-2 learned `123` and `45` from web text, but because digit runs are unlimited and a leading space attaches, ` 678` becomes ` 6|78`, so the same digits split inconsistently.
-3. **Newer tokenizers force structure.** cl100k/o200k use `\p{N}{1,3}` and detach the space, so numbers are always chunked into groups of three from the left: `123|45`, `678`.
-
-### 3. Why pre-split at all
-
-Without the regex (`--raw`), BPE learns tokens like `ing the `, `she was `, `, but `, `that\n`. Compression on the novel is actually *better* (2.93 vs 2.77 bytes/token), but the vocabulary gets spent on this one book's phrases, the same word gets different ids depending on its neighbours, and common words like `return` fall apart (`re|tur|n `). Small loss in compression, much cleaner and more reusable tokens.
-
-## What I'd try next
-
-- Train on mixed English + Hindi + code and watch the token tax shrink
-- Use right-to-left 3-digit grouping for numbers (`12|345`) and test whether it matters
-- Make training faster: incremental pair counts instead of recounting every merge
-
-
-   | Model  | Params | Val loss |
-   |--------|-------:|---------:|
-   | Bigram | 16.8M  | 3.57     |
+| File | What it does |
+|---|---|
+| `bpe.py` | Byte-level BPE tokenizer (from bpe-from-scratch) |
+| `prepare.py` | Trains/loads the tokenizer, streams TinyStories, writes `uint16` token files |
+| `bigram.py` | `get_batch`, bigram model, train/val loss logging, sampling |
